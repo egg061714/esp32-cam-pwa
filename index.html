@@ -2,27 +2,48 @@
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>MQTT 影像訂閱檢視器</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>ESP32-CAM 影像訂閱（PWA）</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+
+  <!-- mqtt.js（瀏覽器版）-->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
   <style>
     :root { color-scheme: light dark; }
-    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; }
-    header { padding: 12px 16px; border-bottom: 1px solid #ddd; display:flex; gap:16px; align-items:baseline; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    #statusbar { display:flex; gap:16px; font-size:14px; color:#666; }
-    #viewer { display:grid; place-items:center; min-height: calc(100dvh - 64px); background:#111; }
-    #frame { max-width: 100%; max-height: calc(100dvh - 64px); object-fit: contain; background:#000; }
-    .tag { padding:2px 6px; border-radius:6px; background:#eee; color:#333; font-size:12px; }
+    html, body { height:100%; }
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; background:#0b0b0b; color:#e5e5e5;}
+    header { padding:12px 16px; border-bottom:1px solid #1f2937; display:flex; gap:12px; align-items:center; }
+    h1 { font-size:16px; margin:0; font-weight:600; }
+    .tag { font-size:12px; padding:2px 6px; border-radius:6px; background:#e5e7eb; color:#111; }
+    #statusbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    #meta { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:12px; opacity:.85; }
+    #viewer { position:fixed; inset:0; top:56px; display:grid; place-items:center; background:#000;}
+    #frame { max-width:100%; max-height: calc(100dvh - 56px); object-fit:contain; background:#000; }
+    #toolbar { margin-left:auto; display:flex; gap:8px; }
+    button { border:1px solid #334155; background:#111827; color:#e5e5e5; padding:6px 10px; border-radius:10px; font-size:13px; }
+    button:active { transform: translateY(1px); }
+    .hide { display:none !important; }
   </style>
 </head>
 <body>
   <header>
-    <strong>MQTT 影像訂閱檢視器</strong>
+    <h1>ESP32-CAM 影像訂閱</h1>
     <div id="statusbar">
       <span id="conn" class="tag">尚未連線</span>
       <span id="status">尚未接收影像</span>
-      <span id="meta" class="mono"></span>
+      <span id="meta"></span>
+    </div>
+    <div id="toolbar">
+      <button id="installBtn" class="hide" title="安裝到主畫面">安裝</button>
+      <button id="wakeBtn" title="螢幕常亮">常亮：關</button>
+      <button id="fsBtn" title="全螢幕">全螢幕</button>
     </div>
   </header>
 
@@ -31,28 +52,71 @@
   </main>
 
   <script>
-    // 依你的設定（以 WebSocket 入口為主）
+    // === 依你的使用情境調整（若部署在 HTTPS，必須使用 WSS） ===
     const CONFIG = {
-      brokerUrl: 'ws://broker.emqx.io:8083/mqtt', // 若未設路徑，試 'ws://192.168.0.66:9001'
-      topic: 'cam/aaaaaaaaaa/mqtt_cam',
+      brokerUrl: 'wss://broker.emqx.io:8084/mqtt',
+      topic: 'cam/aaaaaaaaaa/mqtt_cam',  // ← 改成你自訂的隨機字串
       qos: 0,
-      username: '',         // 你的 MQTTUser
-      password: '',         // 你的 MQTTPassword
+      username: '',           // 公共 broker 通常免帳密
+      password: '',
       clientId: 'webcam-' + Math.random().toString(16).slice(2, 10),
       keepalive: 30,
       reconnectMs: 2000,
       clean: true,
-      protocolVersion: 4,   // MQTT v3.1.1
+      protocolVersion: 4,     // MQTT v3.1.1
     };
+    // ==========================================================
 
+    // PWA 安裝流程
+    let deferredPrompt = null;
+    const installBtn = document.getElementById('installBtn');
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault(); deferredPrompt = e; installBtn.classList.remove('hide');
+    });
+    installBtn.addEventListener('click', async () => {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      deferredPrompt = null; installBtn.classList.add('hide');
+    });
+
+    // Service Worker 註冊（HTTPS 或 localhost 才會成功）
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(console.error);
+    }
+
+    // UI 控制
     const connEl   = document.getElementById('conn');
     const statusEl = document.getElementById('status');
     const metaEl   = document.getElementById('meta');
     const imgEl    = document.getElementById('frame');
+    const fsBtn    = document.getElementById('fsBtn');
+    const wakeBtn  = document.getElementById('wakeBtn');
 
     function setConn(t){ connEl.textContent = t; }
     function setStatus(t){ statusEl.textContent = t; }
 
+    fsBtn.addEventListener('click', async () => {
+      const el = document.documentElement;
+      if (!document.fullscreenElement) await el.requestFullscreen().catch(()=>{});
+      else await document.exitFullscreen().catch(()=>{});
+    });
+
+    // 螢幕常亮
+    let wakeLock = null;
+    async function toggleWakeLock() {
+      try {
+        if (!('wakeLock' in navigator)) { alert('此裝置/瀏覽器不支援螢幕常亮'); return; }
+        if (wakeLock) { await wakeLock.release(); wakeLock = null; wakeBtn.textContent = '常亮：關'; }
+        else { wakeLock = await navigator.wakeLock.request('screen'); wakeBtn.textContent = '常亮：開'; }
+      } catch (e) { console.warn(e); }
+    }
+    wakeBtn.addEventListener('click', toggleWakeLock);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && wakeLock) navigator.wakeLock.request('screen').then(w=>wakeLock=w).catch(()=>{});
+    });
+
+    // MQTT 連線（WebSocket）
     const client = mqtt.connect(CONFIG.brokerUrl, {
       clientId: CONFIG.clientId,
       username: CONFIG.username || undefined,
@@ -88,26 +152,22 @@
       }
     });
 
+    // 支援：二進位 JPEG、Base64、JSON 包 Base64
     function renderFrame(data) {
       try {
         if (data instanceof Uint8Array) {
-          // 若為 JPEG（FFD8 開頭），直接顯示
           if (data.length > 2 && data[0] === 0xFF && data[1] === 0xD8) {
             const blob = new Blob([data], { type: 'image/jpeg' });
             return setImageBlob(blob);
           }
-          // 其他情況先轉字串
           data = new TextDecoder().decode(data);
         } else if (typeof data !== 'string') {
           data = String(data);
         }
 
         const s = data.trim();
-
-        // 已含 data URI
         if (s.startsWith('data:image/')) return setImageSrc(s, false);
 
-        // JSON 包 base64：{ base64|data|image, mime? }
         if (s.startsWith('{')) {
           try {
             const obj = JSON.parse(s);
@@ -120,15 +180,12 @@
           } catch(_) {}
         }
 
-        // 純 base64
         if (/^[A-Za-z0-9+/=\r\n]+$/.test(s) && (s.length % 4 === 0)) {
           return setImageSrc(`data:image/jpeg;base64,${s}`, false);
         }
 
         console.warn('[Unrecognized payload]', s.slice(0,64));
-      } catch (e) {
-        console.error('[renderFrame error]', e);
-      }
+      } catch (e) { console.error('[renderFrame error]', e); }
     }
 
     function setImageBlob(blob) {
