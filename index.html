@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MQTT 影像訂閱檢視器</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; }
+    header { padding: 12px 16px; border-bottom: 1px solid #ddd; display:flex; gap:16px; align-items:baseline; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #statusbar { display:flex; gap:16px; font-size:14px; color:#666; }
+    #viewer { display:grid; place-items:center; min-height: calc(100dvh - 64px); background:#111; }
+    #frame { max-width: 100%; max-height: calc(100dvh - 64px); object-fit: contain; background:#000; }
+    .tag { padding:2px 6px; border-radius:6px; background:#eee; color:#333; font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>MQTT 影像訂閱檢視器</strong>
+    <div id="statusbar">
+      <span id="conn" class="tag">尚未連線</span>
+      <span id="status">尚未接收影像</span>
+      <span id="meta" class="mono"></span>
+    </div>
+  </header>
+
+  <main id="viewer">
+    <img id="frame" alt="等待影像…" />
+  </main>
+
+  <script>
+    // 依你的設定（以 WebSocket 入口為主）
+    const CONFIG = {
+      brokerUrl: 'ws://broker.emqx.io:8083/mqtt', // 若未設路徑，試 'ws://192.168.0.66:9001'
+      topic: 'cam/aaaaaaaaaa/mqtt_cam',
+      qos: 0,
+      username: '',         // 你的 MQTTUser
+      password: '',         // 你的 MQTTPassword
+      clientId: 'webcam-' + Math.random().toString(16).slice(2, 10),
+      keepalive: 30,
+      reconnectMs: 2000,
+      clean: true,
+      protocolVersion: 4,   // MQTT v3.1.1
+    };
+
+    const connEl   = document.getElementById('conn');
+    const statusEl = document.getElementById('status');
+    const metaEl   = document.getElementById('meta');
+    const imgEl    = document.getElementById('frame');
+
+    function setConn(t){ connEl.textContent = t; }
+    function setStatus(t){ statusEl.textContent = t; }
+
+    const client = mqtt.connect(CONFIG.brokerUrl, {
+      clientId: CONFIG.clientId,
+      username: CONFIG.username || undefined,
+      password: CONFIG.password || undefined,
+      keepalive: CONFIG.keepalive,
+      reconnectPeriod: CONFIG.reconnectMs,
+      clean: CONFIG.clean,
+      protocolVersion: CONFIG.protocolVersion,
+    });
+
+    client.on('connect', () => {
+      setConn('已連線');
+      metaEl.textContent = `topic="${CONFIG.topic}", qos=${CONFIG.qos}`;
+      client.subscribe(CONFIG.topic, { qos: CONFIG.qos }, (err) => {
+        if (err) setStatus('訂閱失敗：' + err.message);
+        else setStatus('已訂閱，等待影像…');
+      });
+    });
+    client.on('reconnect', () => setConn('重新連線中…'));
+    client.on('close',     () => setConn('已斷線'));
+    client.on('error', (e) => { setConn('錯誤'); setStatus('連線錯誤：' + e.message); console.error(e); });
+
+    let lastObjectURL = null;
+    let lastTs = 0, frames = 0;
+
+    client.on('message', (_topic, payload) => {
+      renderFrame(payload);
+      const now = performance.now();
+      frames++;
+      if (now - lastTs > 1000) {
+        metaEl.textContent = `topic="${CONFIG.topic}", FPS≈${frames}`;
+        lastTs = now; frames = 0;
+      }
+    });
+
+    function renderFrame(data) {
+      try {
+        if (data instanceof Uint8Array) {
+          // 若為 JPEG（FFD8 開頭），直接顯示
+          if (data.length > 2 && data[0] === 0xFF && data[1] === 0xD8) {
+            const blob = new Blob([data], { type: 'image/jpeg' });
+            return setImageBlob(blob);
+          }
+          // 其他情況先轉字串
+          data = new TextDecoder().decode(data);
+        } else if (typeof data !== 'string') {
+          data = String(data);
+        }
+
+        const s = data.trim();
+
+        // 已含 data URI
+        if (s.startsWith('data:image/')) return setImageSrc(s, false);
+
+        // JSON 包 base64：{ base64|data|image, mime? }
+        if (s.startsWith('{')) {
+          try {
+            const obj = JSON.parse(s);
+            const b64 = obj.base64 || obj.data || obj.image;
+            if (b64) {
+              const mime = obj.mime || 'image/jpeg';
+              const src = b64.startsWith('data:') ? b64 : `data:${mime};base64,${b64}`;
+              return setImageSrc(src, false);
+            }
+          } catch(_) {}
+        }
+
+        // 純 base64
+        if (/^[A-Za-z0-9+/=\r\n]+$/.test(s) && (s.length % 4 === 0)) {
+          return setImageSrc(`data:image/jpeg;base64,${s}`, false);
+        }
+
+        console.warn('[Unrecognized payload]', s.slice(0,64));
+      } catch (e) {
+        console.error('[renderFrame error]', e);
+      }
+    }
+
+    function setImageBlob(blob) {
+      const url = URL.createObjectURL(blob);
+      setImageSrc(url, true);
+    }
+    function setImageSrc(src, isObjectURL) {
+      if (isObjectURL && lastObjectURL && lastObjectURL !== src) {
+        URL.revokeObjectURL(lastObjectURL);
+      }
+      imgEl.src = src;
+      if (isObjectURL) lastObjectURL = src;
+      setStatus('已接收影像於 ' + new Date().toLocaleTimeString());
+    }
+    window.addEventListener('beforeunload', () => {
+      if (lastObjectURL) URL.revokeObjectURL(lastObjectURL);
+    });
+  </script>
+</body>
+</html>

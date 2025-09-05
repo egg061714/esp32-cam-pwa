@@ -1,0 +1,40 @@
+// 簡易快取 App 殼層（不攔截 WebSocket；僅離線快啟）
+const CACHE = 'cam-viewer-v1';
+const ASSETS = [
+  './',
+  './index.html',
+  './manifest.webmanifest',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  'https://unpkg.com/mqtt/dist/mqtt.min.js'
+];
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+});
+
+self.addEventListener('fetch', (e) => {
+  const { request } = e;
+  // 略過非 GET 或 WebSocket
+  if (request.method !== 'GET' || request.url.startsWith('ws')) return;
+
+  e.respondWith(
+    caches.match(request).then((hit) =>
+      hit ||
+      fetch(request).then((resp) => {
+        // 嘗試動態快取同源資源
+        const copy = resp.clone();
+        caches.open(CACHE).then((c) => c.put(request, copy)).catch(()=>{});
+        return resp;
+      }).catch(() => caches.match('./index.html'))
+    )
+  );
+});
